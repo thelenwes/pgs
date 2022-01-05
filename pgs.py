@@ -198,22 +198,90 @@ def _predict_times_for_station(arg, N_lat, N_lon, N_d, x, y, stlo, stla, grid_di
     
     return t_p, t_s
 
-def compute_traveltimes_grid(N_lat, N_lon, N_d, x, y, stlo, stla, grid_dists, del_dist, grid_times_p, grid_times_s,
+def _compute_amp(distKM, type='body', freq=6, beta=2, Q=90, a0=1):
+    '''
+    :param: distKM: Distance between source and station (km)
+    :param: type: Type of waves ('body' or 'surface') (default 'body')
+    :param: a0: initial amplitude (default 1)
+    :param: frequency: center frequency (hz, default 3)
+    :param: Q: quality factor (default 50)
+    :param: beta: surface wave speed (km/s, default 1 )
+    :return: amplitude in m/s
+    '''
+
+    if type == 'body':
+        # Calculate B
+        B = (np.pi * freq) / (Q * beta);
+        # Calculate Amplitude
+        amp = a0 * (np.exp(-B * distKM) / distKM);
+    else:
+        # Calculate B
+        B = (np.pi * freq) / (Q * beta)
+        # Calculate Amplitude
+        # amp = a0*(np.exp(-B*r)/np.sqrt(r))
+        amp = a0 * np.power(distKM, -0.5) * np.exp(-B * distKM)
+
+    return amp
+
+def _predict_amps_for_station(arg, N_lat, N_lon, N_d, x, y, stlo, stla, type, freq, beta, Q, amp0):
+    '''
+    (PRIVATE) Computes predicted amplitude at a single station (arg provides the index) for each grid node
+    '''
+
+    g = Geod(ellps='sphere')
+
+    amps = np.zeros((N_lat, N_lon, N_d))
+    for i in range(0, N_lat):
+        for j in range(0, N_lon):
+            for k in range(0, N_d):
+                az12, az21, dist = g.inv(x[i, j], y[i, j], stlo[arg], stla[arg])
+                dist = dist / 1000
+
+                amps[i,j,k] = _compute_amp(dist, type=type, freq=freq, beta=beta, Q=Q, a0=amp0)
+    return amps
+
+
+def compute_amps_grid(N_lat, N_lon, N_d, x, y, stlo, stla, type, freq, beta, Q, amp0,
                              threads_per_worker=1, n_workers=12):
     '''
     Computes traveltimes for each grid node and station location by interpolating 1D travel time curves
     '''
-    
+
     client = Client(threads_per_worker=threads_per_worker, n_workers=n_workers)
 
     N_s = len(stla)
 
     lazy_results = []
     for i in range(0, N_s):
-        lazy_result = dask.delayed(_predict_times_for_station)(i, N_lat, N_lon, 
+        lazy_result = dask.delayed(_predict_amps_for_station)(i, N_lat, N_lon,
+                                                              N_d, x, y, stlo,
+                                                              stla, type, freq,
+                                                              beta, Q, amp0)
+        lazy_results.append(lazy_result)
+
+    # Running loop with dask:
+    res = dask.compute(*lazy_results)
+    res = np.array(res)
+    amps = res[:, 0, :, :, :]
+
+    return amps
+
+def compute_traveltimes_grid(N_lat, N_lon, N_d, x, y, stlo, stla, grid_dists, del_dist, grid_times_p, grid_times_s,
+                             threads_per_worker=1, n_workers=12):
+    '''
+    Computes traveltimes for each grid node and station location by interpolating 1D travel time curves
+    '''
+
+    client = Client(threads_per_worker=threads_per_worker, n_workers=n_workers)
+
+    N_s = len(stla)
+
+    lazy_results = []
+    for i in range(0, N_s):
+        lazy_result = dask.delayed(_predict_times_for_station)(i, N_lat, N_lon,
                                    N_d, x, y, stlo, stla, grid_dists, del_dist, grid_times_p, grid_times_s)
         lazy_results.append(lazy_result)
-    
+
     # Running loop with dask:
     res = dask.compute(*lazy_results)
     res = np.array(res)
