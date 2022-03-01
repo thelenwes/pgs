@@ -1,4 +1,4 @@
-name: pgsLaptop
+name: pgs
 channels:
   - conda-forge
   - defaults
