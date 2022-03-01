@@ -5,8 +5,7 @@ channels:
 dependencies:
   - utm
   - obspy
-  - numpy
-  - pyproj
+  - numpy=1.18
   - cartopy
   - matplotlib
   - ipython

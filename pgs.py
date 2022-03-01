@@ -59,9 +59,14 @@ def make_model_file(config, del_dist=5, p_phase=['P','p'], s_phase=['S','s'],
                                         n_workers=n_workers)
     b = compute_backazimuths_grid(config['grid']['N_lat'], config['grid']['N_lon'], x, y,
                                   config['stations']['stlo'], config['stations']['stla'])
-    
+    a = compute_amps(config['grid']['N_lat'], config['grid']['N_lon'], config['grid']['N_d'],
+                     x, y, config['stations']['stlo'], config['stations']['stla'],
+                     config['ampParams']['frequency'], config['ampParams']['beta'],
+                     config['ampParams']['Q'], config['ampParams']['wavetype'],
+                     threads_per_worker=threads_per_worker, n_workers=n_workers
+                     )
     # Saving predictions for source grid:
-    data = [t_p, t_s, b]
+    data = [t_p, t_s, b, a]
     pickle.dump(data, open(config['model_file'], 'wb'))
 
 def make_source_grid(bounds, N_lon, N_lat, N_d):
@@ -198,23 +203,138 @@ def _predict_times_for_station(arg, N_lat, N_lon, N_d, x, y, stlo, stla, grid_di
     
     return t_p, t_s
 
+def _compute_amp(distKM, wavetype='body', freq=6, beta=2, Q=90, a0=1):
+    '''
+    :param: distKM: Distance between source and station (km)
+    :param: wavetype: Type of waves ('body' or 'surface') (default 'body')
+    :param: a0: initial amplitude (default 1)
+    :param: frequency: center frequency (hz, default 3)
+    :param: Q: quality factor (default 50)
+    :param: beta: surface wave speed (km/s, default 1 )
+    :return: amplitude in m/s
+    '''
+
+    # Calculate B
+    B = (np.pi * freq) / (Q * beta)
+    if wavetype == 'body':
+        # Calculate Amplitude assuming body waves
+        amp = a0 * (np.exp(-B * distKM) / distKM)
+    else:
+        # Calculate Amplitude assuming surface waves
+        amp = a0 * np.power(distKM, -0.5) * np.exp(-B * distKM)
+
+    return amp
+
+def _compute_amp_ratio(amps, rads, wavetype='body', freq=6, beta=2, Q=90, debug=False):
+    '''
+     We don't know the a0 ahead of time (or necessarily care), so we need to take the ratio of
+     amplitudes in order to create a measure that is invariant of a0
+    '''
+    ratio0 = []
+    if debug:
+        print('#---------------------------')
+        print('Radii')
+        print(rads)
+        print('Amplitudes')
+        print(amps)
+        print('wavetype: {}, freq: {}, beta: {}, Q: {}'.format(wavetype, freq, beta, Q))
+    for cntr, nowAmp in enumerate(amps):
+        if cntr == 0:
+            # project a0
+            normalizedAmp = _compute_amp(np.array(rads[0]), wavetype=wavetype, a0=1, freq=freq, beta=beta, Q=Q)
+            projectedAmp = nowAmp / normalizedAmp
+            ratio0.append(projectedAmp / nowAmp)
+            if debug:
+                print('Radius: {}, RawAmp: {}, Normalized Amp: {}, Projected Amp: {}, Ratio: {}'.format(rads[0], nowAmp, normalizedAmp, projectedAmp, projectedAmp / nowAmp))
+        else:
+            ratio0.append(nowAmp / amps[cntr - 1])
+            if debug:
+                print('Ratio: {}'.format(nowAmp / amps[cntr - 1]))
+    if debug:
+       print('#--------------------------------------------')
+
+    ''' # This method gives away the last measurement, I think I've avoided it above
+    ratio0 = []
+    for cntr, nowAmp in enumerate(amps):
+        if cntr < len(amps) - 1:
+            ratio0.append(nowAmp / amps[cntr + 1])
+    ratio0.append(0)
+    '''
+
+    return np.array(ratio0)
+
+def _predict_amps_grid(i, j, k, x, y, stlo, stla, wavetype, freq, beta, Q):
+    ''' Computes amplitude from a particular grid node to all stations using a least squares
+        approach.'''
+
+    g = Geod(ellps='sphere')
+    rads = []
+    for nowLon, nowLat in zip(stlo, stla): # Loop over stations to get radius (need to add depth/elev)
+        az12, az21, dist = g.inv(x[i, j], y[i, j], nowLon, nowLat)
+        rads.append(dist / 1000)   # Distance in km
+
+    amps = _compute_amp(np.array(rads), wavetype=wavetype, freq=freq, beta=beta, Q=Q, a0=1)
+
+    # Compute ratio so that we can ignore a0
+    ratio = _compute_amp_ratio(amps, rads, wavetype=wavetype, freq=freq, beta=beta, Q=Q)
+
+    return ratio
+
+
+def compute_amps(N_lat, N_lon, N_d, x, y, stlo, stla, freq, beta, Q, wavetype,
+                             threads_per_worker=1, n_workers=12):
+    ''' Computes amplitudes for each node using a least squares approach, which removes a
+        dependence on calculating a0 '''
+
+    client = Client(threads_per_worker=threads_per_worker, n_workers=n_workers)
+
+    N_s = len(stla)
+
+    lazy_results = []
+
+    '''
+    amps = np.zeros((N_lat, N_lon, N_d))
+    for i in range(0, N_lat):
+        for j in range(0, N_lon):
+            for k in range(0, N_d):
+                lazy_result = dask.delayed(_predict_amps_grid)(i, j, k,
+                                                               x, y, stlo,
+                                                              stla, wavetype,
+                                                              freq, beta, Q)
+        lazy_results.append(lazy_result)
+
+    # Running loop with dask:
+    res = dask.compute(*lazy_results)
+    res = np.array(res)
+    amps = res[:, 0, :, :, :]
+    '''
+    amps = np.zeros((len(stlo), N_lat, N_lon, N_d))
+    for i in range(0, N_lat):
+        for j in range(0, N_lon):
+            for k in range(0, N_d):
+                # This should produce an nsta length vector for each grid node
+                gamp = _predict_amps_grid(i, j, k, x, y, stlo, stla, wavetype, freq, beta, Q)
+                for l in range(0,len(stlo)):
+                    amps[l,i,j,k] = gamp[l]
+    return amps
+
 def compute_traveltimes_grid(N_lat, N_lon, N_d, x, y, stlo, stla, grid_dists, del_dist, grid_times_p, grid_times_s,
                              threads_per_worker=1, n_workers=12):
     '''
     Computes traveltimes for each grid node and station location by interpolating 1D travel time curves
     '''
-    
+
     client = Client(threads_per_worker=threads_per_worker, n_workers=n_workers)
 
     N_s = len(stla)
 
     lazy_results = []
     for i in range(0, N_s):
-        lazy_result = dask.delayed(_predict_times_for_station)(i, N_lat, N_lon, 
+        lazy_result = dask.delayed(_predict_times_for_station)(i, N_lat, N_lon,
                                    N_d, x, y, stlo, stla, grid_dists, del_dist, grid_times_p, grid_times_s)
         lazy_results.append(lazy_result)
-    
-    # Running loop with dask:
+
+    # Running loop with dask
     res = dask.compute(*lazy_results)
     res = np.array(res)
     t_p = res[:,0,:,:,:]
@@ -240,13 +360,14 @@ def compute_backazimuths_grid(N_lat, N_lon, x, y, stlo, stla):
     
     return b
 
-def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=0):
+def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=0, std_a=0):
     '''
     Computes synthetic observed arrival times and backazimuths for a given model, event, indices
     of stations that observed the event (stid_event), stations, and specified uncertainties, where:
     - std_p is the standard deviation of Gaussian errors to add to P-wave arrivals
     - std_s is the standard deviation of Gaussian errors to add to S-wave arrivals
     - std_b is the standard deviation of Gaussian errors to add to backazimuth measurements
+    - std_a is the standard deviation of Gaussian errors to add to amplitude measurements
     '''
     
     g = Geod(ellps='sphere')
@@ -270,10 +391,13 @@ def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=
     t_noi_p = np.random.normal(0, std_p, N_sta)
     t_noi_s = np.random.normal(0, std_s, N_sta)
     b_noi = np.random.normal(0, std_b, N_sta)
-    
+    a_noi = np.random.normal(0, std_a, N_sta)
+
+    rads = []
     for i in range(0, N_sta):
         az12,az21,dist = g.inv(evlo,evla,stlo[i],stla[i])
         dist = dist/1000
+        rads.append(dist)
         arrivals_p = model.get_travel_times(source_depth_in_km=evdp,
                                       distance_in_degree=dist/111.1,
                                       phase_list=["P","p"])
@@ -283,7 +407,17 @@ def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=
         t_a_p[i] = evt0 + (arrivals_p[0].time + t_noi_p[i])/86400
         t_a_s[i] = evt0 + (arrivals_s[0].time + t_noi_s[i])/86400
         b_a[i] = (az21 + b_noi[i]) % 360.
-    
+    # Calculate the ratio of the amps (a0 invariant)
+    amps = _compute_amp(np.array(rads), wavetype = config['ampParams']['wavetype'],
+                        freq = config['ampParams']['frequency'],
+                        beta = config['ampParams']['beta'],
+                        Q = config['ampParams']['Q'], a0=1e-7)
+    a_r = _compute_amp_ratio(amps, np.array(rads),
+                             wavetype = config['ampParams']['wavetype'],
+                             freq = config['ampParams']['frequency'],
+                             beta = config['ampParams']['beta'],
+                             Q = config['ampParams']['Q'])
+
     # Converting config to a string and adding predictions:
     config = toml.dumps(config)
     config = config + '\n'
@@ -291,6 +425,7 @@ def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=
     config = config + '\n' + 't_p = ' + str([str(UTCDateTime(num2date(t_a_p_i))) for t_a_p_i in t_a_p])
     config = config + '\n' + 't_s = ' + str([str(UTCDateTime(num2date(t_a_s_i))) for t_a_s_i in t_a_s])
     config = config + '\n' + 'b = ' + str([str(b_a_i) for b_a_i in b_a])
+    config = config + '\n' + 'a_r = ' + str([str(a_r_i) for a_r_i in a_r])
 
     # Converting config to TOML and writing to file:
     config = toml.loads(config)
@@ -310,7 +445,7 @@ def gaussian(residual, std):
     
     return gauss
 
-def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b, b_a, use_p, use_s, use_b, t_std, b_std):
+def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b, b_a, a, a_a, use_p, use_s, use_b, use_a, t_std, b_std, a_std):
     '''
     Returns the likelihood for an event hypothesis defined by (i, j, k, t0)
     
@@ -334,7 +469,7 @@ def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b,
         
         # ---------
         # Define whether to use P, S, or backazimuth for the specific station:
-        use_p_l = use_p; use_s_l = use_s; use_b_l = use_b
+        use_p_l = use_p; use_s_l = use_s; use_b_l = use_b; use_a_l = use_a
         # Turning off P, S, or backazimuth if the measurement is None for specific station:
         if not(t_a_p[l]):
             use_p_l = False
@@ -342,7 +477,24 @@ def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b,
             use_s_l = False
         if not(b_a[l]):
             use_b_l = False
+        if not(a_a[l]):
+            use_a_l = False
         # ---------
+        if use_p_l:
+            res_p = (t_a_p[l] - tpp) * 86400
+            likl = likl * gaussian(res_p, t_std)
+        if use_s_l:
+            res_s = (t_a_s[l] - tps) * 86400
+            likl = likl * gaussian(res_s, t_std)
+        if use_b_l:
+            angle_diff = (b_a[l] - b[l, i, j])
+            res_b = (angle_diff + 180) % 360 - 180
+            likl = likl * gaussian(res_b, b_std)
+        if use_a_l:
+            res_a = a_a[l] - a[l, i, j, k]
+            likl = likl * gaussian(res_a, a_std)
+
+        '''
         if use_p_l:
             res_p = (t_a_p[l] - tpp)*86400
         if use_s_l:
@@ -350,7 +502,8 @@ def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b,
         if use_b_l:
             angle_diff = (b_a[l] - b[l, i, j])
             res_b = (angle_diff+180) % 360 - 180
-
+        if use_a_l:
+            res_a = a_a[l]-a[l,i,j,k]
         if use_p_l:
             if use_s_l:
                 if use_b_l:
@@ -371,10 +524,11 @@ def _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b,
             else:
                 if use_b_l:
                     likl = likl * gaussian(res_b, b_std)
+        '''
     
     return likl
 
-def _get_likelihood_for_origintime(arg, N_lat, N_lon, N_d, t0s, t_p, t_s, t_a_p, t_a_s, t_std, use_p, use_s, b, b_a, use_b, b_std):
+def _get_likelihood_for_origintime(arg, N_lat, N_lon, N_d, t0s, t_p, t_s, t_a_p, t_a_s, t_std, use_p, use_s, b, b_a, use_b, b_std, a, a_a, use_a, a_std):
     '''
     Calls get_likelihood_for_event_hypothesis multiple times for each
     event hypothesis for a specific origin time
@@ -387,11 +541,11 @@ def _get_likelihood_for_origintime(arg, N_lat, N_lon, N_d, t0s, t_p, t_s, t_a_p,
     for i in range(0, N_lat):
         for j in range(0, N_lon):
             for k in range(0, N_d):
-                likl[i,j,k] = _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b, b_a, use_p, use_s, use_b, t_std, b_std)
+                likl[i,j,k] = _get_likelihood_for_event_hypothesis(i, j, k, t0, t_p, t_s, t_a_p, t_a_s, b, b_a, a, a_a, use_p, use_s, use_b, use_a, t_std, b_std, a_std)
     
     return likl
 
-def do_location(config, t_std=0.2, b_std=5, use_p = True, use_s=True, use_b=False,
+def do_location(config, t_std=0.2, b_std=5, a_std=1, use_p=True, use_s=True, use_b=False, use_a=False,
                 threads_per_worker=1, n_workers=12):
     '''
     Performs location over a range of origin times t0s_in using travel time predictions (and spatial
@@ -409,7 +563,7 @@ def do_location(config, t_std=0.2, b_std=5, use_p = True, use_s=True, use_b=Fals
 
     # Reading data from prediction_file:
     data = pickle.load(open(config['model_file'], 'rb'))
-    t_p = data[0]; t_s = data[1]; b = data[2]
+    t_p = data[0]; t_s = data[1]; b = data[2]; a = data[3];
 
     # Reading parameters from configuration:
     bounds = config['grid']['bounds']; N_lon = config['grid']['N_lon']
@@ -438,11 +592,19 @@ def do_location(config, t_std=0.2, b_std=5, use_p = True, use_s=True, use_b=Fals
             b_a.append(None)
         else:
             b_a.append(float(b_i))
-    
+
+    a_a = []
+    for a_r_i in config['data']['a_r']:
+        if a_r_i == '':
+            a_a.append(None)
+        else:
+            a_a.append(float(a_r_i))
+
     lazy_results = []
     for i in range(0, len(t0s)):
         lazy_result = dask.delayed(_get_likelihood_for_origintime)(i, N_lat, N_lon, N_d, 
-                                   t0s, t_p, t_s, t_a_p, t_a_s, t_std, use_p, use_s, b, b_a, use_b, b_std)
+                                   t0s, t_p, t_s, t_a_p, t_a_s, t_std, use_p, use_s, b, b_a, use_b, b_std,
+                                   a, a_a, use_a, a_std)
         lazy_results.append(lazy_result)
     
     # Running loop with dask:
