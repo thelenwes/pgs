@@ -225,20 +225,33 @@ def _compute_amp(distKM, wavetype='body', freq=6, beta=2, Q=90, a0=1):
 
     return amp
 
-def _compute_amp_ratio(amps, rads, wavetype='body', freq=6, beta=2, Q=90):
+def _compute_amp_ratio(amps, rads, wavetype='body', freq=6, beta=2, Q=90, debug=False):
     '''
      We don't know the a0 ahead of time (or necessarily care), so we need to take the ratio of
      amplitudes in order to create a measure that is invariant of a0
     '''
     ratio0 = []
+    if debug:
+        print('#---------------------------')
+        print('Radii')
+        print(rads)
+        print('Amplitudes')
+        print(amps)
+        print('wavetype: {}, freq: {}, beta: {}, Q: {}'.format(wavetype, freq, beta, Q))
     for cntr, nowAmp in enumerate(amps):
         if cntr == 0:
             # project a0
             normalizedAmp = _compute_amp(np.array(rads[0]), wavetype=wavetype, a0=1, freq=freq, beta=beta, Q=Q)
             projectedAmp = nowAmp / normalizedAmp
             ratio0.append(projectedAmp / nowAmp)
+            if debug:
+                print('Radius: {}, RawAmp: {}, Normalized Amp: {}, Projected Amp: {}, Ratio: {}'.format(rads[0], nowAmp, normalizedAmp, projectedAmp, projectedAmp / nowAmp))
         else:
             ratio0.append(nowAmp / amps[cntr - 1])
+            if debug:
+                print('Ratio: {}'.format(nowAmp / amps[cntr - 1]))
+    if debug:
+       print('#--------------------------------------------')
 
     ''' # This method gives away the last measurement, I think I've avoided it above
     ratio0 = []
@@ -395,11 +408,15 @@ def compute_predictions(config, evla, evlo, evdp, evt0, std_p=0, std_s=0, std_b=
         t_a_s[i] = evt0 + (arrivals_s[0].time + t_noi_s[i])/86400
         b_a[i] = (az21 + b_noi[i]) % 360.
     # Calculate the ratio of the amps (a0 invariant)
-    a_r = _compute_amp_ratio(_compute_amp(np.array(rads),
-                                          wavetype = config['ampParams']['wavetype'],
-                                          freq = config['ampParams']['frequency'],
-                                          beta = config['ampParams']['beta'],
-                                          Q = config['ampParams']['Q']), np.array(rads))
+    amps = _compute_amp(np.array(rads), wavetype = config['ampParams']['wavetype'],
+                        freq = config['ampParams']['frequency'],
+                        beta = config['ampParams']['beta'],
+                        Q = config['ampParams']['Q'], a0=1e-7)
+    a_r = _compute_amp_ratio(amps, np.array(rads),
+                             wavetype = config['ampParams']['wavetype'],
+                             freq = config['ampParams']['frequency'],
+                             beta = config['ampParams']['beta'],
+                             Q = config['ampParams']['Q'])
 
     # Converting config to a string and adding predictions:
     config = toml.dumps(config)

@@ -1,12 +1,11 @@
-name: pgs
+name: pgsLaptop
 channels:
   - conda-forge
   - defaults
 dependencies:
   - utm
   - obspy
-  - numpy
-  - pyproj
+  - numpy=1.18
   - cartopy
   - matplotlib
   - ipython
